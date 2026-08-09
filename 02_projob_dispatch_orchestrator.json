@@ -1,0 +1,340 @@
+{
+  "name": "ProJob Dispatch Orchestrator",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dispatch-job",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "New Job Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1120, 300],
+      "webhookId": "projob-dispatch"
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "getAll",
+        "tableId": "subcontractors",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "availability_status",
+              "condition": "eq",
+              "keyValue": "available"
+            }
+          ]
+        },
+        "returnAll": true
+      },
+      "id": "fetch-subs",
+      "name": "Get Available Subcontractors",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [-880, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_YOUR_SUPABASE_CRED_ID",
+          "name": "ProJob Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the orchestrator prompt: job details + curated subcontractor context.\n// This mirrors the AOrchestra 4-tuple: Instruction, Context, Tools, Model.\n// We keep context TIGHT — only fields the model needs to decide, nothing else.\n\nconst job = $('New Job Request').first().json.body;\nconst subs = items.map(i => i.json);\n\nconst subContext = subs.map(s => ({\n  id: s.id,\n  name: s.name,\n  specialties: s.specialties,\n  service_area: s.service_area,\n  rating: s.rating,\n  active_job_count: s.active_job_count\n}));\n\nconst systemPrompt = `You are the dispatch orchestrator for ProJob, a Florida contracting service.\nYour ONLY job: pick the single best subcontractor for this job, or flag for human escalation.\n\nDecision rules:\n- Prefer subs whose specialties match the service_type.\n- Prefer subs whose service_area includes the job city.\n- Prefer higher rating and LOWER active_job_count (avoid overloading one sub).\n- If no sub is a clean match (wrong area, wrong specialty, or all overloaded), set escalate=true and explain why.\n- Never invent a subcontractor id. Only choose from the provided list.\n\nRespond with ONLY valid JSON, no markdown, no prose outside the JSON:\n{\n  \"selected_subcontractor_id\": \"<uuid or null>\",\n  \"selected_subcontractor_name\": \"<name or null>\",\n  \"reasoning\": \"<one or two sentences>\",\n  \"confidence\": <0.0-1.0>,\n  \"escalate\": <true|false>,\n  \"escalation_reason\": \"<string or null>\",\n  \"dispatch_message\": \"<short message to send the chosen subcontractor, or null>\"\n}`;\n\nconst userPrompt = `JOB:\\n${JSON.stringify(job, null, 2)}\\n\\nAVAILABLE SUBCONTRACTORS:\\n${JSON.stringify(subContext, null, 2)}`;\n\nreturn [{ json: { systemPrompt, userPrompt, job } }];"
+      },
+      "id": "build-prompt",
+      "name": "Build Orchestrator Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-640, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OLLAMA_BASE_URL || 'http://localhost:11434' }}/api/chat",
+        "sendHeaders": false,
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: $env.OLLAMA_MODEL || \"llama3.1:8b\",\n  stream: false,\n  format: \"json\",\n  messages: [\n    { role: \"system\", content: $json.systemPrompt },\n    { role: \"user\", content: $json.userPrompt }\n  ]\n}) }}",
+        "options": {}
+      },
+      "id": "call-ollama",
+      "name": "Ask Orchestrator (Local Ollama)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-400, 300],
+      "notes": "No credential needed — hits your local/self-hosted Ollama instance, free. Set OLLAMA_BASE_URL and OLLAMA_MODEL as n8n environment variables (Settings > Variables), or just hardcode the URL/model here if you don't use env vars. Use whatever model you already have pulled (llama3.1:8b, qwen2.5:7b, mistral, etc). 'format: json' tells Ollama to force valid JSON output — needs a reasonably recent Ollama version."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the local Ollama response. Ollama's /api/chat returns { message: { content }, ... }.\nconst response = items[0].json;\nlet decision;\ntry {\n  decision = JSON.parse(response.message.content);\n} catch (e) {\n  decision = { escalate: true, escalation_reason: 'Failed to parse orchestrator response', confidence: 0 };\n}\n\nconst job = $('Build Orchestrator Prompt').first().json.job;\n\nreturn [{\n  json: {\n    ...decision,\n    job,\n    model_used: response.model || 'local-ollama',\n    cost_usd: 0,          // local model — no per-call cost\n    raw_response: response\n  }\n}];"
+      },
+      "id": "parse-decision",
+      "name": "Parse Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-160, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.escalate }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            },
+            {
+              "leftValue": "={{ $json.confidence }}",
+              "rightValue": 0.6,
+              "operator": { "type": "number", "operation": "lt" }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "confidence-check",
+      "name": "Needs Human? ",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [80, 300]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "create",
+        "tableId": "dispatch_log",
+        "fieldsUi": {
+          "fieldValues": [
+            { "fieldId": "job_id", "fieldValue": "={{ $json.job.id }}" },
+            { "fieldId": "selected_subcontractor_id", "fieldValue": "={{ $json.selected_subcontractor_id }}" },
+            { "fieldId": "reasoning", "fieldValue": "={{ $json.reasoning }}" },
+            { "fieldId": "confidence", "fieldValue": "={{ $json.confidence }}" },
+            { "fieldId": "escalated", "fieldValue": "={{ $json.escalate }}" },
+            { "fieldId": "escalation_reason", "fieldValue": "={{ $json.escalation_reason }}" },
+            { "fieldId": "model_used", "fieldValue": "={{ $json.model_used }}" },
+            { "fieldId": "cost_usd", "fieldValue": "={{ $json.cost_usd }}" }
+          ]
+        }
+      },
+      "id": "log-decision",
+      "name": "Log Decision to Supabase",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [340, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_YOUR_SUPABASE_CRED_ID",
+          "name": "ProJob Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "tableId": "jobs",
+        "filterType": "manual",
+        "matchingColumns": [{ "keyName": "id", "keyValue": "={{ $json.job.id }}" }],
+        "fieldsUi": {
+          "fieldValues": [
+            { "fieldId": "status", "fieldValue": "dispatched" },
+            { "fieldId": "assigned_subcontractor_id", "fieldValue": "={{ $json.selected_subcontractor_id }}" }
+          ]
+        }
+      },
+      "id": "update-job-dispatched",
+      "name": "Mark Job Dispatched",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [560, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_YOUR_SUPABASE_CRED_ID",
+          "name": "ProJob Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "tableId": "subcontractors",
+        "filterType": "manual",
+        "matchingColumns": [
+          { "keyName": "id", "keyValue": "={{ $json.selected_subcontractor_id }}" }
+        ],
+        "fieldsUi": {
+          "fieldValues": [
+            { "fieldId": "contact_phone", "fieldValue": "" },
+            { "fieldId": "contact_email", "fieldValue": "" }
+          ]
+        }
+      },
+      "id": "lookup-sub-phone",
+      "name": "Lookup Sub Phone",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [780, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_YOUR_SUPABASE_CRED_ID",
+          "name": "ProJob Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.twilio.com/2010-04-01/Accounts/{{ $env.TWILIO_ACCOUNT_SID }}/Messages.json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/x-www-form-urlencoded" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "formUrlencoded",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "To",   "value": "={{ $json.contact_phone }}" },
+            { "name": "From", "value": "={{ $env.TWILIO_FROM_NUMBER }}" },
+            { "name": "Body", "value": "={{ $json.dispatch_message }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "send-sms",
+      "name": "Send SMS via Twilio",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1000, 200],
+      "notes": "Uses HTTP Basic auth with Account SID + Auth Token (set under Credentials > HTTP Basic Auth). Requires env vars TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN (in the basic-auth credential), and TWILIO_FROM_NUMBER. If you prefer the native Twilio node, swap this for n8n-nodes-base.twilio with the same parameters."
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "create",
+        "tableId": "dispatch_log",
+        "fieldsUi": {
+          "fieldValues": [
+            { "fieldId": "job_id", "fieldValue": "={{ $json.job.id }}" },
+            { "fieldId": "escalated", "fieldValue": true },
+            { "fieldId": "escalation_reason", "fieldValue": "={{ $json.escalation_reason }}" },
+            { "fieldId": "confidence", "fieldValue": "={{ $json.confidence }}" },
+            { "fieldId": "model_used", "fieldValue": "={{ $json.model_used }}" },
+            { "fieldId": "cost_usd", "fieldValue": "={{ $json.cost_usd }}" }
+          ]
+        }
+      },
+      "id": "log-escalation",
+      "name": "Log Escalation",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [340, 420],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_YOUR_SUPABASE_CRED_ID",
+          "name": "ProJob Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "tableId": "jobs",
+        "filterType": "manual",
+        "matchingColumns": [{ "keyName": "id", "keyValue": "={{ $json.job.id }}" }],
+        "fieldsUi": {
+          "fieldValues": [{ "fieldId": "status", "fieldValue": "escalated" }]
+        }
+      },
+      "id": "update-job-escalated",
+      "name": "Mark Job Escalated",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [560, 420],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_YOUR_SUPABASE_CRED_ID",
+          "name": "ProJob Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.OSCAR_ALERT_FROM_EMAIL || 'dispatch@projob.example' }}",
+        "toEmail": "={{ $env.OSCAR_ALERT_TO_EMAIL || 'oscar@projob.example' }}",
+        "subject": "=ProJob: Manual dispatch needed (job {{ $json.job.id }})",
+        "text": "=Job {{ $json.job.id }} needs manual dispatch.\n\nReason: {{ $json.escalation_reason }}\n\nJob details:\n{{ JSON.stringify($json.job, null, 2) }}",
+        "options": {}
+      },
+      "id": "notify-oscar",
+      "name": "Notify Oscar (Email)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "options": {},
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_WITH_YOUR_SMTP_CRED_ID",
+          "name": "ProJob SMTP"
+        }
+      },
+      "position": [780, 420]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "respond-dispatched",
+      "name": "Respond (Dispatched)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1000, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "respond-escalated",
+      "name": "Respond (Escalated)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1000, 420]
+    }
+  ],
+  "connections": {
+    "New Job Request": { "main": [[{ "node": "Get Available Subcontractors", "type": "main", "index": 0 }]] },
+    "Get Available Subcontractors": { "main": [[{ "node": "Build Orchestrator Prompt", "type": "main", "index": 0 }]] },
+    "Build Orchestrator Prompt": { "main": [[{ "node": "Ask Orchestrator (Local Ollama)", "type": "main", "index": 0 }]] },
+    "Ask Orchestrator (Local Ollama)": { "main": [[{ "node": "Parse Decision", "type": "main", "index": 0 }]] },
+    "Parse Decision": { "main": [[{ "node": "Needs Human? ", "type": "main", "index": 0 }]] },
+    "Needs Human? ": {
+      "main": [
+        [{ "node": "Log Escalation", "type": "main", "index": 0 }],
+        [{ "node": "Log Decision to Supabase", "type": "main", "index": 0 }]
+      ]
+    },
+    "Log Decision to Supabase": { "main": [[{ "node": "Mark Job Dispatched", "type": "main", "index": 0 }]] },
+    "Mark Job Dispatched": { "main": [[{ "node": "Lookup Sub Phone", "type": "main", "index": 0 }]] },
+    "Lookup Sub Phone": { "main": [[{ "node": "Send SMS via Twilio", "type": "main", "index": 0 }]] },
+    "Send SMS via Twilio": { "main": [[{ "node": "Respond (Dispatched)", "type": "main", "index": 0 }]] },
+    "Log Escalation": { "main": [[{ "node": "Mark Job Escalated", "type": "main", "index": 0 }]] },
+    "Mark Job Escalated": { "main": [[{ "node": "Notify Oscar (Email)", "type": "main", "index": 0 }]] },
+    "Notify Oscar (Email)": { "main": [[{ "node": "Respond (Escalated)", "type": "main", "index": 0 }]] }
+  }
+}
